@@ -68,8 +68,12 @@ func (s *server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 			return nil
 		}
 		if err != nil {
+			if status.Code(err) == codes.Canceled {
+				log.Println("[Process] Stream cancelled, finishing up")
+				return nil
+			}
 			log.Printf("[Process] Error receiving request: %v", err)
-			return status.Errorf(codes.Unknown, "cannot receive stream request: %v", err)
+			return err
 		}
 
 		log.Printf("[Process] Received request: %+v", req)
@@ -102,35 +106,44 @@ func (s *server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 			prompt, _ := bodyMap["prompt"].(string)
 			log.Printf("[Process] Extracted prompt: %s", prompt)
 
-			if checkRisk(prompt) {
-				log.Println("[Process] Risky prompt detected, returning 403")
-
+			if os.Getenv("DISABLE_PROMPT_RISK_CHECK") == "yes" {
+				log.Println("[Process] Prompt risk check disabled via env var, allowing request")
 				resp = &extProcPb.ProcessingResponse{
-					Response: &extProcPb.ProcessingResponse_ImmediateResponse{
-						ImmediateResponse: &extProcPb.ImmediateResponse{
-							Status: &statusPb.HttpStatus{
-								Code: statusPb.StatusCode_Forbidden,
-							},
-							Body: []byte(`{"error":"Prompt blocked by content policy"}`),
-							Headers: &extProcPb.HeaderMutation{
-								SetHeaders: []*corePb.HeaderValueOption{
-									{
-										Header: &corePb.HeaderValue{
-											Key:   "Content-Type",
-											Value: "application/json",
+					Response: &extProcPb.ProcessingResponse_RequestBody{
+						RequestBody: &extProcPb.BodyResponse{},
+					},
+				}
+			} else {
+				if checkRisk(prompt) {
+					log.Println("[Process] Risky prompt detected, returning 403")
+
+					resp = &extProcPb.ProcessingResponse{
+						Response: &extProcPb.ProcessingResponse_ImmediateResponse{
+							ImmediateResponse: &extProcPb.ImmediateResponse{
+								Status: &statusPb.HttpStatus{
+									Code: statusPb.StatusCode_Forbidden,
+								},
+								Body: []byte(`{"error":"Prompt blocked by content policy"}`),
+								Headers: &extProcPb.HeaderMutation{
+									SetHeaders: []*corePb.HeaderValueOption{
+										{
+											Header: &corePb.HeaderValue{
+												Key:   "Content-Type",
+												Value: "application/json",
+											},
 										},
 									},
 								},
 							},
 						},
-					},
-				}
-			} else {
-				log.Println("[Process] Prompt safe, allowing request")
-				resp = &extProcPb.ProcessingResponse{
-					Response: &extProcPb.ProcessingResponse_RequestBody{
-						RequestBody: &extProcPb.BodyResponse{},
-					},
+					}
+				} else {
+					log.Println("[Process] Prompt safe, allowing request")
+					resp = &extProcPb.ProcessingResponse{
+						Response: &extProcPb.ProcessingResponse_RequestBody{
+							RequestBody: &extProcPb.BodyResponse{},
+						},
+					}
 				}
 			}
 
@@ -141,7 +154,6 @@ func (s *server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 
 		case *extProcPb.ProcessingRequest_ResponseHeaders:
 			log.Println("[Process] Processing ResponseHeaders, instructing Envoy to buffer response body")
-			// buffer the response body
 			resp = &extProcPb.ProcessingResponse{
 				Response: &extProcPb.ProcessingResponse_ResponseHeaders{
 					ResponseHeaders: &extProcPb.HeadersResponse{},
@@ -152,31 +164,86 @@ func (s *server) Process(srv extProcPb.ExternalProcessor_ProcessServer) error {
 				},
 			}
 			log.Println("[Process] ResponseHeaders processed, buffering response body")
+			if err := srv.Send(resp); err != nil {
+				log.Printf("[Process] Error sending response headers: %v", err)
+				return status.Errorf(codes.Unknown, "cannot send stream response: %v", err)
+			}
 
 		case *extProcPb.ProcessingRequest_ResponseBody:
 			log.Println("[Process] Processing ResponseBody")
 			rb := r.ResponseBody
 			log.Printf("[Process] ResponseBody received, EndOfStream: %v", rb.EndOfStream)
+
 			if !rb.EndOfStream {
 				log.Println("[Process] ResponseBody not complete, continuing to buffer")
+				break
+			}
+
+			bodyStr := string(rb.Body)
+			log.Printf("[Process] Full response body: %s", bodyStr)
+
+			var respData map[string]interface{}
+			if err := json.Unmarshal(rb.Body, &respData); err != nil {
+				log.Printf("[Process] Failed to parse response body: %v", err)
+				return status.Errorf(codes.InvalidArgument, "invalid response body: %v", err)
+			}
+
+			var generated string
+			choices, ok := respData["choices"].([]interface{})
+			if ok && len(choices) > 0 {
+				first, _ := choices[0].(map[string]interface{})
+				generated, _ = first["text"].(string)
+			}
+			log.Printf("[Process] Extracted response text: %s", generated)
+
+			if os.Getenv("DISABLE_RESPONSE_RISK_CHECK") == "yes" {
+				log.Println("[Process] Response risk check disabled via env var, allowing response")
 				resp = &extProcPb.ProcessingResponse{
 					Response: &extProcPb.ProcessingResponse_ResponseBody{
 						ResponseBody: &extProcPb.BodyResponse{},
 					},
 				}
-				break
+			} else {
+				if checkRisk(generated) {
+					log.Println("[Process] Risky LLM output detected, blocking response")
+					resp = &extProcPb.ProcessingResponse{
+						Response: &extProcPb.ProcessingResponse_ImmediateResponse{
+							ImmediateResponse: &extProcPb.ImmediateResponse{
+								Status: &statusPb.HttpStatus{
+									Code: statusPb.StatusCode_Forbidden,
+								},
+								Body: []byte(`{"error":"LLM output blocked by safety filter"}`),
+								Headers: &extProcPb.HeaderMutation{
+									SetHeaders: []*corePb.HeaderValueOption{
+										{
+											Header: &corePb.HeaderValue{
+												Key:   "Content-Type",
+												Value: "application/json",
+											},
+										},
+									},
+								},
+							},
+						},
+					}
+				} else {
+					log.Println("[Process] LLM output safe, allowing response")
+					resp = &extProcPb.ProcessingResponse{
+						Response: &extProcPb.ProcessingResponse_ResponseBody{
+							ResponseBody: &extProcPb.BodyResponse{},
+						},
+					}
+				}
 			}
-			log.Println("[Process] ResponseBody processed")
+
+			if err := srv.Send(resp); err != nil {
+				log.Printf("[Process] Error sending response: %v", err)
+				return status.Errorf(codes.Unknown, "cannot send stream response: %v", err)
+			}
 
 		default:
 			log.Printf("[Process] Received unrecognized request type: %+v", r)
 			resp = &extProcPb.ProcessingResponse{}
-		}
-
-		if err := srv.Send(resp); err != nil {
-			log.Printf("[Process] Error sending response: %v", err)
-		} else {
-			log.Printf("[Process] Sent response: %+v", resp)
 		}
 	}
 }
