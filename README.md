@@ -1,7 +1,11 @@
 # ext_proc for LLM prompt & response risk assessment
 
+## Summary
+
 An Envoy ext_proc filter for assessing LLM prompts & responses for risk by
 calling a risk assessment LLM like granite-guardian.
+
+## Instructions
 
 You will need the granite-guardian model running somewhere first.
 Here is an example kserve InferenceService to deploy a version of it
@@ -104,3 +108,10 @@ curl -v http://$GATEWAY_HOST/openai/v1/completions \
 * Connection #0 to host 192.168.97.4 left intact
 {"error":"Prompt blocked by content policy"}
 ```
+
+## Optional Env Vars
+
+* `DISABLE_PROMPT_RISK_CHECK` - If set to "yes", skips risk checks on prompts
+* `DISABLE_RESPONSE_RISK_CHECK` - If set to "yes", skips risk checks on responses
+
+If unset, both prompt and response risk checks are active.
